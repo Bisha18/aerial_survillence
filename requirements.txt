@@ -1,0 +1,21 @@
+# Aerial Surveillance System — Dependencies
+# Tested on Python 3.10+
+
+# Core detection
+ultralytics>=8.2.0          # YOLOv8 (auto-downloads yolov8n.pt)
+
+# Computer vision
+opencv-python>=4.9.0        # Frame processing, drawing, colormap
+
+# Numerical computing
+numpy>=1.26.0               # Array ops, Kalman filter
+scipy>=1.12.0               # Hungarian algorithm for SORT matching
+
+# Dashboard
+streamlit>=1.35.0           # Web UI
+
+# Optional: faster inference on CPU (uncomment if needed)
+# onnxruntime>=1.17.0       # Export model to ONNX for faster CPU inference
+
+# Utilities (usually bundled with Python)
+# collections, logging, time, argparse, dataclasses — stdlib

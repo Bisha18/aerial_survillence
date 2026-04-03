@@ -1,6 +1,21 @@
 """
 tracker.py - Lightweight SORT (Simple Online and Realtime Tracking) implementation
 Pure NumPy/SciPy — no heavy dependencies. Assigns unique IDs across frames.
+
+BUGS FIXED:
+  1. associate_detections_to_trackers: The original first loop added low-IoU pairs to
+     unmatched_det/unmatched_trk, but since those indices were never placed in
+     matched_*_set, the sweep loops below added them AGAIN — causing each unmatched
+     detection to spawn two KalmanBoxTrackers per frame. Fixed by only collecting
+     true matches in the first loop and letting the sweep loops handle unmatched.
+
+  2. SORTTracker.__init__ now resets KalmanBoxTracker._count to 0 so track IDs
+     restart from 1 on each new session (critical for Streamlit multi-run scenarios
+     where the same process handles many sequential video uploads).
+
+  3. Cleaned up predicted_boxes / trackers sync: instead of a post-hoc deletion loop
+     with an ambiguous ternary pop, we now build valid_trackers and predicted_boxes
+     together in a single pass, keeping them guaranteed to be in sync.
 """
 
 import numpy as np
@@ -20,7 +35,7 @@ class KalmanBoxTracker:
     Tracks a single object using a Kalman filter.
     State vector: [x1, y1, x2, y2, vx, vy, vw, vh]
     """
-    _count = 0  # Global ID counter
+    _count = 0  # Global ID counter — reset via SORTTracker.__init__ or reset_ids()
 
     def __init__(self, bbox: list):
         """
@@ -114,14 +129,26 @@ def iou(box1: list, box2: list) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def associate_detections_to_trackers(detections: list, trackers: list, iou_threshold: float = 0.3):
+def associate_detections_to_trackers(
+    detections: list, trackers: list, iou_threshold: float = 0.3
+):
     """
     Hungarian algorithm to match detections to existing trackers.
 
+    BUG FIX: The original implementation added (d, t) pairs with IoU < threshold to
+    unmatched_det and unmatched_trk inside the first loop.  Because those indices were
+    never added to matched_det_set / matched_trk_set, the sweep loops at the bottom
+    added them a second time — so every rejected pair produced a duplicate entry.
+    On the next tracker.update() call those duplicate indices caused two brand-new
+    KalmanBoxTrackers to be created from a single detection.
+
+    Fix: only collect genuine matches in the first loop; let the list-comprehension
+    sweeps below build the unmatched sets exclusively.
+
     Returns:
-        matches       → list of (det_idx, trk_idx) pairs
-        unmatched_det → indices of detections with no tracker
-        unmatched_trk → indices of trackers with no detection
+        matches       → list of (det_idx, trk_idx) pairs above iou_threshold
+        unmatched_det → detection indices that were not matched
+        unmatched_trk → tracker indices that were not matched
     """
     if len(trackers) == 0:
         return [], list(range(len(detections))), []
@@ -135,27 +162,20 @@ def associate_detections_to_trackers(detections: list, trackers: list, iou_thres
     # Hungarian assignment (maximize IoU → minimize negative IoU)
     row_ind, col_ind = linear_sum_assignment(-cost_matrix)
 
-    matches, unmatched_det, unmatched_trk = [], [], []
+    matches: list = []
+    matched_det_set: set = set()
+    matched_trk_set: set = set()
 
-    matched_det_set = set()
-    matched_trk_set = set()
-
+    # FIXED: only register pairs that meet the IoU threshold as true matches.
+    # Low-IoU pairs are simply ignored here; the sweeps below handle them correctly.
     for d, t in zip(row_ind, col_ind):
-        if cost_matrix[d, t] < iou_threshold:
-            unmatched_det.append(d)
-            unmatched_trk.append(t)
-        else:
+        if cost_matrix[d, t] >= iou_threshold:
             matches.append((d, t))
             matched_det_set.add(d)
             matched_trk_set.add(t)
 
-    for d in range(len(detections)):
-        if d not in matched_det_set:
-            unmatched_det.append(d)
-
-    for t in range(len(trackers)):
-        if t not in matched_trk_set:
-            unmatched_trk.append(t)
+    unmatched_det = [d for d in range(len(detections)) if d not in matched_det_set]
+    unmatched_trk = [t for t in range(len(trackers))   if t not in matched_trk_set]
 
     return matches, unmatched_det, unmatched_trk
 
@@ -180,22 +200,28 @@ class SORTTracker:
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
-        self.trackers: list[KalmanBoxTracker] = []
+        self.trackers: list = []
         self.frame_count = 0
 
         # Track full trajectories: id → list of center points
-        self.trajectories = defaultdict(list)
+        self.trajectories: dict = defaultdict(list)
+
+        # FIX: Reset global ID counter so each new SORTTracker session starts from 1.
+        # Without this, IDs grow unboundedly across Streamlit reruns (or any scenario
+        # where multiple SORTTracker instances are created in the same process), making
+        # HUD labels confusingly large and wasting trajectory dict memory.
+        KalmanBoxTracker._count = 0
 
         logger.info("SORT Tracker initialized")
 
     def reset_ids(self):
-        """Reset global ID counter (call between different video files)."""
+        """Reset global ID counter and all internal state (call between different video files)."""
         KalmanBoxTracker._count = 0
         self.trackers = []
         self.trajectories.clear()
         self.frame_count = 0
 
-    def update(self, detections: list) -> list[dict]:
+    def update(self, detections: list) -> list:
         """
         Update tracker with new detections for the current frame.
 
@@ -207,20 +233,22 @@ class SORTTracker:
         """
         self.frame_count += 1
 
-        # 1. Predict new positions for all existing trackers
-        predicted_boxes = []
-        to_delete = []
-        for i, trk in enumerate(self.trackers):
+        # 1. Predict new positions for all existing trackers.
+        #
+        # FIX: Build valid_trackers and predicted_boxes in a single pass so the two
+        # lists are always index-aligned.  The original code built predicted_boxes in
+        # a loop and then tried to pop from both lists inside a separate deletion loop,
+        # which required a fragile bounds-check ternary to avoid IndexError.
+        predicted_boxes: list = []
+        valid_trackers: list = []
+        for trk in self.trackers:
             predicted = trk.predict()
-            # Sanity-check prediction is on-screen (rough check)
-            if any(np.isnan(predicted)):
-                to_delete.append(i)
-                continue
-            predicted_boxes.append(predicted)
+            if not any(np.isnan(v) for v in predicted):
+                predicted_boxes.append(predicted)
+                valid_trackers.append(trk)
+            # NaN trackers are simply dropped here — no separate deletion list needed.
 
-        for i in reversed(to_delete):
-            self.trackers.pop(i)
-            predicted_boxes.pop(i) if i < len(predicted_boxes) else None
+        self.trackers = valid_trackers
 
         # 2. Match detections to trackers
         matches, unmatched_det, unmatched_trk = associate_detections_to_trackers(
@@ -240,8 +268,8 @@ class SORTTracker:
             self.trackers.append(new_trk)
 
         # 5. Build output list and prune dead trackers
-        active_tracks = []
-        survivors = []
+        active_tracks: list = []
+        survivors: list = []
 
         for trk in self.trackers:
             if trk.time_since_update > self.max_age:

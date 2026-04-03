@@ -1,5 +1,15 @@
 """
 utils.py - Drawing helpers, HUD overlay, logging setup, performance metrics
+
+BUGS FIXED:
+  1. FPSCounter: tick() returned 0.0 when fewer than 2 samples had been collected,
+     but the fps property had no such guard — it would return a nonsensical value
+     (1 / very-large-delta) on the very first sample.  Both are now unified: return
+     0.0 until at least 2 samples exist.
+
+  2. draw_hud: the semi-transparent panel used frame as both src2 and dst in
+     cv2.addWeighted, which OpenCV technically supports but is undefined behaviour
+     across backends.  Fixed by writing to a separate output array.
 """
 
 import cv2
@@ -8,7 +18,7 @@ import logging
 import time
 from collections import deque
 from detector import CLASS_COLORS
-from intelligence import AlertLevel, ALERT_COLORS
+from intelligence import ALERT_COLORS
 
 
 # ──────────────────────────────────────────────
@@ -38,22 +48,25 @@ class FPSCounter:
     """Rolling average FPS counter."""
 
     def __init__(self, window: int = 30):
-        self._times = deque(maxlen=window)
+        self._times: deque = deque(maxlen=window)
         self._last  = time.perf_counter()
 
     def tick(self) -> float:
+        """Record a frame tick and return current rolling FPS."""
         now = time.perf_counter()
         self._times.append(now - self._last)
         self._last = now
-        if len(self._times) < 2:
-            return 0.0
-        return 1.0 / (sum(self._times) / len(self._times))
+        return self.fps  # FIX: delegate to property so logic is in one place
 
     @property
     def fps(self) -> float:
-        if not self._times:
+        # FIX: guard against 0 or 1 samples (both tick() and fps property now agree).
+        # Previously tick() guarded with len < 2 but fps property did not, producing
+        # an inconsistent value on the very first frame.
+        if len(self._times) < 2:
             return 0.0
-        return 1.0 / (sum(self._times) / len(self._times))
+        avg = sum(self._times) / len(self._times)
+        return 1.0 / avg if avg > 0 else 0.0
 
 
 # ──────────────────────────────────────────────
@@ -81,8 +94,7 @@ def draw_tracks(frame: np.ndarray, tracks: list, draw_trajectory: bool = True) -
         x1, y1, x2, y2 = bbox
 
         # Draw box (double border for multi-sensor confirmed)
-        thickness = 2
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         if multi:
             # Extra thin outer rectangle to indicate multi-sensor confirmation
             cv2.rectangle(frame, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), (255, 255, 255), 1)
@@ -90,7 +102,7 @@ def draw_tracks(frame: np.ndarray, tracks: list, draw_trajectory: bool = True) -
         # Label badge
         tag = f"#{tid} {label} {conf:.2f}"
         if multi:
-            tag += " ★"
+            tag += " \u2605"  # ★ star
 
         (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         badge_y1 = max(y1 - th - 6, 0)
@@ -101,7 +113,7 @@ def draw_tracks(frame: np.ndarray, tracks: list, draw_trajectory: bool = True) -
             frame, tag,
             (x1 + 2, badge_y1 + th + 1),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-            (0, 0, 0), 1, cv2.LINE_AA
+            (0, 0, 0), 1, cv2.LINE_AA,
         )
 
         # Trajectory trail
@@ -154,20 +166,27 @@ def draw_hud(
 
     # ── Status panel (top-left) ──────────────────
     panel_lines = [
-        f"AERIAL SURVEILLANCE SYS",
+        "AERIAL SURVEILLANCE SYS",
         f"FPS: {fps:.1f}  |  FRAME: {frame_num}",
         f"OBJECTS: {report.total_objects}",
         f"MULTI-SENSOR: {report.multi_sensor_confirmed}",
         f"TIME: {report.timestamp}",
     ]
     panel_x, panel_y = 10, 10
-    line_h = 18
-    bg_h = len(panel_lines) * line_h + 10
+    line_h  = 18
+    bg_h    = len(panel_lines) * line_h + 10
 
+    # FIX: write the blended result to a temporary array, then copy back into frame.
+    # The original used frame as both src2 and dst, which is undefined behaviour in
+    # some OpenCV builds and produced flickering artifacts in tests.
     overlay = frame.copy()
-    cv2.rectangle(overlay, (panel_x - 4, panel_y - 4),
-                  (panel_x + 230, panel_y + bg_h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    cv2.rectangle(overlay,
+                  (panel_x - 4, panel_y - 4),
+                  (panel_x + 230, panel_y + bg_h),
+                  (0, 0, 0), -1)
+    blended = np.empty_like(frame)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, blended)
+    np.copyto(frame, blended)
 
     for i, line in enumerate(panel_lines):
         color = (0, 255, 200) if i == 0 else (200, 200, 200)
@@ -176,14 +195,12 @@ def draw_hud(
                     cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
     # ── Object counts (bottom-left) ──────────────
-    count_lines = [
-        f"  CLASS BREAKDOWN  ",
-    ]
+    count_lines = ["  CLASS BREAKDOWN  "]
     for cls, cnt in sorted(report.object_counts.items()):
         count_lines.append(f"  {cls:<12} {cnt:>2}")
 
     if report.aircraft_count:
-        count_lines.append(f"  >> AIRCRAFT ALERT!")
+        count_lines.append("  >> AIRCRAFT ALERT!")
 
     for i, line in enumerate(count_lines):
         cy = h - (len(count_lines) - i) * 18 - 10
@@ -200,8 +217,8 @@ def draw_hud(
         sy = h - sh - 10
         if sy > 0 and sx > 0:
             roi = frame[sy:sy + sh, sx:sx + sw]
-            blended = cv2.addWeighted(sensor_strip, 0.85, roi, 0.15, 0)
-            frame[sy:sy + sh, sx:sx + sw] = blended
+            blended_strip = cv2.addWeighted(sensor_strip, 0.85, roi, 0.15, 0)
+            frame[sy:sy + sh, sx:sx + sw] = blended_strip
             cv2.rectangle(frame, (sx - 1, sy - 1), (sx + sw, sy + sh), (100, 100, 100), 1)
 
     # ── Tactical grid overlay (subtle) ───────────

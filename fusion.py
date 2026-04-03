@@ -1,6 +1,17 @@
 """
 fusion.py - Simulated Multi-Modal Sensor Fusion
 Generates thermal and radar-like views from optical frames, then merges detections.
+
+BUG FIXED:
+  merge_detections: The original code called `d.setdefault("sources", set())` directly
+  on the input detection dicts, mutating them in place.  After the call returned, the
+  caller's optical_dets / thermal_dets / radar_dets lists contained the extra "sources"
+  key — which then leaked into the tracker and intelligence modules, polluting their
+  data with unexpected fields and causing subtle isinstance / key-access bugs in
+  downstream code that iterated over detection dicts.
+
+  Fix: build shallow copies of each detection dict before tagging with "sources" so
+  the originals are never modified.
 """
 
 import cv2
@@ -85,7 +96,7 @@ class MultiModalFusion:
         self,
         optical_dets: list,
         thermal_dets: list,
-        radar_dets: list,
+        radar_dets:   list,
     ) -> list:
         """
         Merge detections from all three modalities.
@@ -101,31 +112,36 @@ class MultiModalFusion:
             radar_dets:   Detections from the radar view
 
         Returns:
-            Merged, deduplicated list of detections
+            Merged, deduplicated list of detections (input lists are NOT mutated)
         """
         if not self.enabled:
             return optical_dets
 
-        # Tag source modality
-        for d in optical_dets:
-            d.setdefault("sources", set()).add("optical")
-        for d in thermal_dets:
-            d.setdefault("sources", set()).add("thermal")
-        for d in radar_dets:
-            d.setdefault("sources", set()).add("radar")
+        # FIX: Create shallow copies of each detection dict before adding the
+        # "sources" key.  The originals must not be modified because the caller may
+        # still reference them (e.g., optical_dets is also passed to the tracker
+        # when fusion is disabled, and leaked keys like "sources" or "multi_sensor"
+        # would confuse downstream dict-iteration in intelligence.py).
+        tagged_optical  = [{**d, "sources": {"optical"}}  for d in optical_dets]
+        tagged_thermal  = [{**d, "sources": {"thermal"}}  for d in thermal_dets]
+        tagged_radar    = [{**d, "sources": {"radar"}}    for d in radar_dets]
 
-        all_dets = optical_dets + thermal_dets + radar_dets
+        all_dets = tagged_optical + tagged_thermal + tagged_radar
 
         if not all_dets:
             return []
 
         # Cross-check: if two detections from different modalities overlap,
         # merge them (take the higher-confidence one and boost slightly)
-        merged = []
+        merged: list = []
         used = [False] * len(all_dets)
 
         # Sort by confidence descending
-        sorted_idx = sorted(range(len(all_dets)), key=lambda i: all_dets[i]["conf"], reverse=True)
+        sorted_idx = sorted(
+            range(len(all_dets)),
+            key=lambda i: all_dets[i]["conf"],
+            reverse=True,
+        )
 
         for i in sorted_idx:
             if used[i]:
@@ -157,7 +173,12 @@ class MultiModalFusion:
     # Sidebar overlay utilities
     # ──────────────────────────────────────────────
 
-    def create_sensor_strip(self, thermal_frame: np.ndarray, radar_frame: np.ndarray, strip_height: int = 120) -> np.ndarray:
+    def create_sensor_strip(
+        self,
+        thermal_frame: np.ndarray,
+        radar_frame: np.ndarray,
+        strip_height: int = 120,
+    ) -> np.ndarray:
         """
         Creates a compact side-by-side thumbnail strip of thermal + radar views.
         Used for the HUD overlay display.
@@ -166,11 +187,13 @@ class MultiModalFusion:
         w = int(h * thermal_frame.shape[1] / thermal_frame.shape[0])
 
         thermal_thumb = cv2.resize(thermal_frame, (w, h))
-        radar_thumb = cv2.resize(radar_frame, (w, h))
+        radar_thumb   = cv2.resize(radar_frame,   (w, h))
 
         # Add labels
-        cv2.putText(thermal_thumb, "THERMAL", (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(radar_thumb,  "RADAR",   (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.putText(thermal_thumb, "THERMAL", (4, 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.putText(radar_thumb,   "RADAR",   (4, 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         strip = np.hstack([thermal_thumb, radar_thumb])
         return strip
